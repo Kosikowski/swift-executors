@@ -1,3 +1,6 @@
+[![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FKosikowski%2Fswift-executors%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/Kosikowski/swift-executors)
+[![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2FKosikowski%2Fswift-executors%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/Kosikowski/swift-executors)
+
 # Swift Executors
 
 A Swift library providing custom task executors for fine-grained control over concurrency and thread management in Swift applications.
