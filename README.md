@@ -17,7 +17,7 @@ Swift Executors provides three main executor types that allow you to control how
 - **Thread Affinity**: Pin tasks to specific threads with `ThreadExecutor` for frameworks requiring thread-local storage
 - **Quality of Service**: Configure QoS levels for priority handling
 - **Swift Concurrency Integration**: Seamlessly works with Swift's async/await and structured concurrency
-- **Cross-Platform**: Supports iOS 17+ and macOS 15+
+- **Cross-Platform**: Supports iOS 18+ and macOS 15+
 
 ## Installation
 

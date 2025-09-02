@@ -31,8 +31,6 @@ public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
     /// and is guaranteed to exist before `init` returns.
     private var runLoop: CFRunLoop!
 
-    // ... rest of the class remains unchanged ...
-
     /// Spins up the thread & run-loop pair exactly once.
     ///
     /// - Parameter name: Shows up in Instruments and thread lists, handy
