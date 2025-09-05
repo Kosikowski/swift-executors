@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "Kosikowski"
+    assignees:
+      - "Kosikowski"
+
+  # Swift Package Manager (if any dependencies are added in the future)
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "Kosikowski"
+    assignees:
+      - "Kosikowski"

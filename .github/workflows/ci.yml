@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  # macOS Build and Test
+  build-macos:
+    runs-on: macos-latest
+    name: macOS (Swift 6.1.2)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+      - name: Install Swift 6.1.2
+        uses: SwiftyLab/setup-swift@v1
+        with:
+          swift-version: '6.1.2'
+      - name: Show versions
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Clean build directory
+        run: rm -rf .build
+      - name: Build and Test
+        run: |
+          swift build -v
+          swift test -v
+      - name: Build CLI
+        run: swift build --product SwiftExecutorsCLI -v
+
+  # iOS Build and Test using xcodebuild
+  build-ios:
+    runs-on: macos-latest
+    name: iOS Build (Swift 6.1.2)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+      - name: Install Swift 6.1.2
+        uses: SwiftyLab/setup-swift@v1
+        with:
+          swift-version: '6.1.2'
+      - name: Clean build directory
+        run: rm -rf .build
+      - name: Build and Test for iOS
+        run: |
+          # Build for iOS using xcodebuild
+          xcodebuild -scheme SwiftExecutors -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.6' build
+          # Test using swift test (which should work after the build)
+          swift test
+
+  # Code Quality (macOS only)
+  code-quality:
+    name: Code Quality
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Swift
+      uses: SwiftyLab/setup-swift@v1
+      with:
+        swift-version: '6.1.2'
+        
+    - name: Check SwiftFormat (if config exists)
+      run: |
+        if [ -f .swiftformat ]; then
+          brew install swiftformat
+          swiftformat --lint --config .swiftformat Sources/ Tests/
+        else
+          echo "No SwiftFormat config found, skipping format check"
+        fi
+      
+  # Package Validation
+  package-validation:
+    name: Package Validation
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Swift
+      uses: SwiftyLab/setup-swift@v1
+      with:
+        swift-version: '6.1.2'
+        
+    - name: Check package description
+      run: swift package describe
+
+  # Release job - only runs on tag pushes
+  release:
+    name: Create Release
+    runs-on: macos-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-ios, code-quality, package-validation]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '16'
+      
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## What's Changed
+          
+          This release includes:
+          - Swift Executors library for task execution
+          - Support for iOS 18+ and macOS 15+
+          - CLI tool for executor demonstrations
+          - Thread, Queue, and DispatchQueue executors
+          
+          ## Installation
+          
+          ```swift
+          .package(url: "https://github.com/mateuszkosikowski/swift-executors.git", from: "${{ github.ref_name }}")
+          ```
+          
+          ## Usage
+          
+          ```swift
+          import SwiftExecutors
+          
+          let executor = ThreadExecutor()
+          // ... use the executor
+          ```
+        draft: false
+        prerelease: false 
