@@ -43,7 +43,7 @@ jobs:
   # iOS Build and Test
   build-ios:
     runs-on: macos-latest
-    name: iOS (Swift 6.1.2)
+    name: iOS Build (Swift 6.1.2)
     steps:
       - uses: actions/checkout@v4
       - name: Setup Xcode
@@ -56,10 +56,12 @@ jobs:
           swift-version: '6.1.2'
       - name: Clean build directory
         run: rm -rf .build
-      - name: Build and Test for iOS
+      - name: Build for iOS Simulator
         run: |
-          swift build -v --destination "platform=iOS Simulator,name=iPhone 16,OS=18.6"
-          swift test -v --destination "platform=iOS Simulator,name=iPhone 16,OS=18.6"
+          swift build --triple arm64-apple-ios18.0-simulator -v
+      - name: Test for iOS Simulator
+        run: |
+          swift test --triple arm64-apple-ios18.0-simulator -v
 
   # Code Quality (macOS only)
   code-quality:
