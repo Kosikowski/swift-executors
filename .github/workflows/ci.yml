@@ -56,12 +56,10 @@ jobs:
           swift-version: '6.1.2'
       - name: Clean build directory
         run: rm -rf .build
-      - name: Build for iOS using xcodebuild
+      - name: Build and Test for iOS
         run: |
-          xcodebuild -scheme SwiftExecutors -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' build
-      - name: Test for iOS using xcodebuild
-        run: |
-          xcodebuild -scheme SwiftExecutors -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' test
+          swift build -v --destination "platform=iOS Simulator,name=iPhone 16,OS=18.6"
+          swift test -v --destination "platform=iOS Simulator,name=iPhone 16,OS=18.6"
 
   # Code Quality (macOS only)
   code-quality:
