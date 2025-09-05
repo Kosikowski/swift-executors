@@ -40,7 +40,7 @@ jobs:
       - name: Build CLI
         run: swift build --product SwiftExecutorsCLI -v
 
-  # iOS Build and Test
+  # iOS Build and Test using xcodebuild
   build-ios:
     runs-on: macos-latest
     name: iOS Build (Swift 6.1.2)
@@ -56,12 +56,12 @@ jobs:
           swift-version: '6.1.2'
       - name: Clean build directory
         run: rm -rf .build
-      - name: Build for iOS Simulator
+      - name: Build and Test for iOS
         run: |
-          swift build --triple arm64-apple-ios18.0-simulator -v
-      - name: Test for iOS Simulator
-        run: |
-          swift test --triple arm64-apple-ios18.0-simulator -v
+          # Build for iOS using xcodebuild
+          xcodebuild -scheme SwiftExecutors -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.6' build
+          # Test using swift test (which should work after the build)
+          swift test
 
   # Code Quality (macOS only)
   code-quality:
@@ -93,8 +93,7 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v5
-      
+      uses: actions/checkout@v5      
     - name: Setup Swift
       uses: SwiftyLab/setup-swift@v1
       with:
