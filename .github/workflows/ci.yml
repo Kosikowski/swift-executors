@@ -58,8 +58,8 @@ jobs:
         run: rm -rf .build
       - name: Build and Test for iOS
         run: |
-          swift build -v --destination 'platform=iOS Simulator,name=iPhone 15,OS=latest'
-          swift test -v --destination 'platform=iOS Simulator,name=iPhone 15,OS=latest'
+          swift build -v --destination 'generic/platform=iOS Simulator'
+          swift test -v --destination 'generic/platform=iOS Simulator'
 
   # Code Quality (macOS only)
   code-quality:
