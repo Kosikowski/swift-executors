@@ -1,24 +1,37 @@
 //
-//  job.swift
-//  swift-executors
+//  ThreadExecutor.swift
+//  SwiftExecutors
 //
 //  Created by Mateusz Kosikowski on 18/06/2025.
 //
 import Foundation
 
-/// A custom executor that pins every actor job to one dedicated Thread.
+/// An executor that runs every job on one dedicated `Thread`.
 ///
 /// When to use it:
 ///   • Legacy C / C++ / Objective-C libraries that rely on thread-local storage
 ///   • Frameworks that demand a single-thread affinity (Core MIDI, Core Audio)
 ///   • Real-time loops that must never hop between cores (jank = audio glitches)
 ///
-/// You *would not* use this for high-throughput background work-that's what a
-/// TaskExecutor + NSOperationQueue or Dispatch queue is for.
+/// It is both a `SerialExecutor` and a `TaskExecutor`:
+///   • as a `SerialExecutor` it can back an actor through `unownedExecutor`,
+///     pinning all of that actor's code to the thread;
+///   • as a `TaskExecutor` it can be passed to `withTaskExecutorPreference(_:)`,
+///     `Task(executorPreference:)` or `group.addTask(executorPreference:)`,
+///     so nonisolated async code runs on the thread too.
 ///
-public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
+/// You *would not* use this for high-throughput background work - that's what a
+/// `QueueTaskExecutor` or `DispatchQueueTaskExecutor` is for.
+///
+public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Sendable {
     /// The long-lived worker thread. Lives for the lifetime of the executor.
-    private var thread: Thread!
+    private let thread: Thread
+
+    /// The worker thread's run loop, used to schedule jobs onto it.
+    private let runLoop: CFRunLoop
+
+    /// The worker thread's POSIX identity, used for cheap isolation checks.
+    private let threadID: pthread_t
 
     /// Exposes the thread for testing purposes only.
     @_spi(ThreadExecutorTesting)
@@ -26,10 +39,11 @@ public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
         thread
     }
 
-    /// We capture the Thread's CFRunLoop so we can schedule blocks onto it.
-    /// NOTE: It's `!` on purpose – the run-loop is set *inside* the thread body
-    /// and is guaranteed to exist before `init` returns.
-    private var runLoop: CFRunLoop!
+    /// Exposes the run loop for testing purposes only.
+    @_spi(ThreadExecutorTesting)
+    public var testRunLoop: CFRunLoop {
+        runLoop
+    }
 
     /// Spins up the thread & run-loop pair exactly once.
     ///
@@ -37,20 +51,32 @@ public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
     ///   for debugging.
     ///
     public init(name: String = "ThreadExecutor") {
-        // Step 1: A semaphore so the main thread can wait until the worker
-        //         thread has captured its run-loop.
-        let ready = DispatchSemaphore(value: 0)
+        // Step 1: Values the worker thread hands back once its run loop exists.
+        //         The semaphore orders the writes before the reads below.
+        let handoff = ThreadHandoff()
 
         // Step 2: Define the thread body - this runs *on the new thread*.
-        let thread = Thread { [weak self] in
-            // Save the run-loop so enqueue(_:) can get to it later.
-            self?.runLoop = CFRunLoopGetCurrent()
+        //         It must not capture `self`: the executor's lifetime is
+        //         driven by its owners, not by its own thread.
+        let thread = Thread {
+            let runLoop = CFRunLoopGetCurrent()!
 
-            // Tell the main thread the run-loop is ready to accept work.
-            ready.signal()
+            // A run loop with no sources returns from CFRunLoopRun() at once,
+            // which would let the thread exit before any job arrives. This
+            // never-signalled source keeps it parked until deinit stops it.
+            var context = CFRunLoopSourceContext()
+            context.perform = { _ in }
+            let keepAlive = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context)
+            CFRunLoopAddSource(runLoop, keepAlive, .defaultMode)
 
-            // Start the run-loop.  From here on the thread parks inside
-            //     the CFRunLoop event pump until we stop it in deinit.
+            handoff.runLoop = runLoop
+            handoff.threadID = pthread_self()
+
+            // Tell the creating thread the run-loop is ready to accept work.
+            handoff.ready.signal()
+
+            // From here on the thread parks inside the CFRunLoop event pump
+            // until deinit stops it.
             CFRunLoopRun()
         }
 
@@ -59,63 +85,87 @@ public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
         thread.qualityOfService = Thread.currentQos // Inherit caller's QoS
         // To prevent priority inversion set to .userInteractive
 
-        self.thread = thread
-
-        // Step 4: Kick the tires - the thread begins executing the closure
-        //         defined above.
+        // Step 4: Start the thread and block until it reports its run loop.
         thread.start()
+        handoff.ready.wait()
 
-        // Step 5: Block *this* thread (the caller) until the worker says
-        //         "run-loop ready."  Guarantees enqueue(_:) won't crash.
-        ready.wait()
+        self.thread = thread
+        runLoop = handoff.runLoop!
+        threadID = handoff.threadID!
     }
 
-    /// Called by the Swift runtime every time an *actor job* arrives.
+    /// Called by the Swift runtime every time a job arrives, whether it is
+    /// isolated to an actor backed by this executor or is a task that prefers
+    /// this executor.
     /// Must be **non-blocking** - schedule, then *return immediately*.
     ///
     public func enqueue(_ job: consuming ExecutorJob) {
-        // 1. Convert the `consuming` job into an UnownedJob wrapper so the
-        //    runtime can safely hold onto it until the callback fires.
-        let unowned = UnownedJob(job)
+        // 1. A noncopyable `ExecutorJob` cannot be captured by an escaping
+        //    closure, so carry it across as an `UnownedJob`. The runtime keeps
+        //    the job alive until it has run.
+        let unownedJob = UnownedJob(job)
 
-        // 2. Grab a *stable* reference to `self` as an unowned executor.
-        //    ︙  IMPORTANT: You MUST cache & reuse this for equality checks.
-        let exec = asUnownedSerialExecutor()
+        // 2. Unowned references to `self` in both roles. Running with both
+        //    makes the job isolated to this serial executor *and* keeps the
+        //    task's executor preference pointed at this thread.
+        let serialExecutor = asUnownedSerialExecutor()
+        let taskExecutor = asUnownedTaskExecutor()
 
         // 3. Ask the run-loop to perform the block on its own thread.
         //    `defaultMode` is fine; if you need a custom mode, pass it here.
-        CFRunLoopPerformBlock(runLoop,
-                              CFRunLoopMode.defaultMode.rawValue)
-        {
-            // 3a. Finally run the job on the target thread.
-            //     `runSynchronously` runs & *removes* the job exactly once.
-            unowned.runSynchronously(on: exec)
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
+            // `runSynchronously` runs & *removes* the job exactly once.
+            unownedJob.runSynchronously(isolatedTo: serialExecutor, taskExecutor: taskExecutor)
         }
 
         // 4. In case the run-loop is napping, prod it so it wakes up soon.
         CFRunLoopWakeUp(runLoop)
     }
 
-    /// Return a canonical, identity-stable wrapper that the runtime can keep
-    /// forever.  Re-creating wrappers on each call breaks equality tests.
+    /// Reports whether the caller is running on this executor's thread.
     ///
-    public func asUnownedSerialExecutor() -> UnownedSerialExecutor {
-        UnownedSerialExecutor(ordinary: self)
+    /// The runtime asks this when it cannot prove isolation from its own
+    /// bookkeeping - for example, `assumeIsolated` called from a C callback
+    /// that the thread-affine library delivers on this thread.
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *)
+    public func isIsolatingCurrentContext() -> Bool? {
+        isCurrentThread
+    }
+
+    /// Crashes unless the caller is running on this executor's thread.
+    ///
+    /// Used by the runtime on OS versions that predate
+    /// `isIsolatingCurrentContext()`.
+    public func checkIsolated() {
+        precondition(isCurrentThread, "Expected to be running on the '\(thread.name ?? "ThreadExecutor")' thread")
+    }
+
+    private var isCurrentThread: Bool {
+        pthread_equal(pthread_self(), threadID) != 0
     }
 
     deinit {
-        // Gracefully stop the run-loop *on its own thread*.
-        // We can't call CFRunLoopStop() from a different thread.
-        CFRunLoopPerformBlock(runLoop,
-                              CFRunLoopMode.defaultMode.rawValue)
-        {
-            CFRunLoopStop(self.runLoop)
+        // Stop the run-loop after the jobs already queued on it have run.
+        // Capture the run loop, not `self`: the block outlives this deinit.
+        let runLoop = runLoop
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
+            CFRunLoopStop(runLoop)
         }
         CFRunLoopWakeUp(runLoop)
 
         // Mark the thread as cancelled so well-behaved APIs can bail out.
         thread.cancel()
     }
+}
+
+/// Carries the worker thread's run loop and identity back to `init`.
+///
+/// Written once on the worker thread before `ready` is signalled, and read
+/// only after `ready.wait()` returns, so the semaphore provides the ordering.
+private final class ThreadHandoff: @unchecked Sendable {
+    let ready = DispatchSemaphore(value: 0)
+    var runLoop: CFRunLoop?
+    var threadID: pthread_t?
 }
 
 extension Thread {

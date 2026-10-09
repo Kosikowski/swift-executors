@@ -4,279 +4,139 @@
 //
 //  Created by Mateusz Kosikowski on 18/06/2025.
 //
+import Dispatch
+import Foundation
 import SwiftExecutors
-import XCTest
+import Testing
 
-final class DispatchQueueTaskExecutorTests: XCTestCase {
-    var executor: DispatchQueueTaskExecutor!
+@Suite("DispatchQueueTaskExecutor")
+struct DispatchQueueTaskExecutorTests {
+    // MARK: - Where work runs
 
-    override func setUp() {
-        super.setUp()
-        executor = DispatchQueueTaskExecutor(label: "TestExecutor")
-    }
+    @Test("Work under the executor preference runs on its queue")
+    func runsOnQueue() async {
+        let executor = DispatchQueueTaskExecutor(label: "test.dispatch.preference")
 
-    override func tearDown() {
-        executor = nil
-        super.tearDown()
-    }
-
-    // MARK: - Initialization Tests
-
-    func testDefaultInitialization() {
-        XCTAssertNotNil(executor, "Executor should be initialized")
-    }
-
-    func testCustomLabelInitialization() {
-        let customExecutor = DispatchQueueTaskExecutor(label: "CustomLabel")
-        XCTAssertNotNil(customExecutor, "Executor with custom label should be initialized")
-    }
-
-    func testConcurrentInitialization() {
-        let concurrentExecutor = DispatchQueueTaskExecutor(
-            label: "ConcurrentTest",
-            qos: .userInitiated,
-            attributes: .concurrent
-        )
-        XCTAssertNotNil(concurrentExecutor, "Concurrent executor should be initialized")
-    }
-
-    func testSerialInitialization() {
-        let serialExecutor = DispatchQueueTaskExecutor(
-            label: "SerialTest",
-            qos: .utility
-        )
-        XCTAssertNotNil(serialExecutor, "Serial executor should be initialized")
-    }
-
-    func testConvenienceConcurrentInitializer() {
-        let concurrentExecutor = DispatchQueueTaskExecutor(
-            concurrentLabel: "ConvenienceConcurrent",
-            qos: .background
-        )
-        XCTAssertNotNil(concurrentExecutor, "Convenience concurrent executor should be initialized")
-    }
-
-    func testConvenienceSerialInitializer() {
-        let serialExecutor = DispatchQueueTaskExecutor(
-            serialLabel: "ConvenienceSerial",
-            qos: .userInteractive
-        )
-        XCTAssertNotNil(serialExecutor, "Convenience serial executor should be initialized")
-    }
-
-    // MARK: - Task Execution Tests
-
-    func testBasicTaskExecution() async {
-        let expectation = XCTestExpectation(description: "Task should execute")
-
-        await withTaskExecutorPreference(executor) {
-            expectation.fulfill()
+        let label = await withTaskExecutorPreference(executor) {
+            await onPreferredExecutor { currentQueueLabel() }
         }
 
-        await fulfillment(of: [expectation], timeout: 1.0)
+        #expect(label == "test.dispatch.preference")
     }
 
-    func testMultipleTaskExecution() async {
-        let expectation = XCTestExpectation(description: "All tasks should execute")
-        expectation.expectedFulfillmentCount = 3
+    @Test("Child tasks that prefer the executor run on its queue")
+    func childTasksRunOnQueue() async {
+        let executor = DispatchQueueTaskExecutor(concurrentLabel: "test.dispatch.children")
 
-        await withTaskExecutorPreference(executor) {
-            expectation.fulfill()
-        }
-
-        await withTaskExecutorPreference(executor) {
-            expectation.fulfill()
-        }
-
-        await withTaskExecutorPreference(executor) {
-            expectation.fulfill()
-        }
-
-        await fulfillment(of: [expectation], timeout: 1.0)
-    }
-
-    func testTaskExecutionWithReturnValue() async {
-        let result = await withTaskExecutorPreference(executor) {
-            "Test Result"
-        }
-
-        XCTAssertEqual(result, "Test Result", "Task should return expected value")
-    }
-
-    func testTaskExecutionWithThrowingFunction() async throws {
-        let result = try await withTaskExecutorPreference(executor) {
-            // Simulate a throwing operation
-            if false {
-                throw TestError.testError
-            }
-            return "Success"
-        }
-
-        XCTAssertEqual(result, "Success", "Throwing task should return expected value")
-    }
-
-    func testTaskExecutionWithError() async {
-        do {
-            _ = try await withTaskExecutorPreference(executor) {
-                throw TestError.testError
-            }
-            XCTFail("Task should throw an error")
-        } catch {
-            XCTAssertEqual(error as? TestError, TestError.testError, "Task should throw expected error")
-        }
-    }
-
-    // MARK: - Concurrency Tests
-
-    func testConcurrentTaskExecution() async {
-        let concurrentExecutor = DispatchQueueTaskExecutor(
-            label: "ConcurrentTest",
-            qos: .default,
-            attributes: .concurrent
-        )
-
-        let expectation = XCTestExpectation(description: "All concurrent tasks should execute")
-        expectation.expectedFulfillmentCount = 5
-
-        await withTaskGroup(of: Void.self) { group in
+        let labels = await withTaskGroup(of: String.self) { group in
             for _ in 0 ..< 5 {
-                group.addTask {
-                    await withTaskExecutorPreference(concurrentExecutor) {
-                        // Simulate some work
-                        try? await Task.sleep(nanoseconds: 100_000) // 0.1ms
-                        expectation.fulfill()
-                    }
-                }
+                group.addTask(executorPreference: executor) { currentQueueLabel() }
             }
+            return await group.reduce(into: []) { $0.append($1) }
         }
 
-        await fulfillment(of: [expectation], timeout: 2.0)
+        #expect(labels == Array(repeating: "test.dispatch.children", count: 5))
     }
 
-    func testSerialTaskExecution() async {
-        let serialExecutor = DispatchQueueTaskExecutor(
-            label: "SerialTest",
-            qos: .default
-        )
+    @Test("A task created with the executor preference runs on its queue")
+    func unstructuredTaskRunsOnQueue() async {
+        let executor = DispatchQueueTaskExecutor(label: "test.dispatch.task")
 
-        let expectation = XCTestExpectation(description: "Tasks should execute in order")
-        expectation.expectedFulfillmentCount = 3
+        let label = await Task(name: "probe", executorPreference: executor) {
+            currentQueueLabel()
+        }.value
+
+        #expect(label == "test.dispatch.task")
+    }
+
+    @Test("Jobs run on the target queue when one is given")
+    func usesTargetQueue() async {
+        let key = DispatchSpecificKey<String>()
+        let target = DispatchQueue(label: "test.dispatch.target")
+        target.setSpecific(key: key, value: "target")
+        let executor = DispatchQueueTaskExecutor(label: "test.dispatch.targeted", target: target)
+
+        let value = await withTaskExecutorPreference(executor) {
+            await onPreferredExecutor { DispatchQueue.getSpecific(key: key) }
+        }
+
+        #expect(value == "target")
+    }
+
+    // MARK: - Serial vs concurrent
+
+    @Test("The serial initializer never overlaps jobs")
+    func serialQueueDoesNotOverlap() async {
+        let executor = DispatchQueueTaskExecutor(serialLabel: "test.dispatch.serial")
+        let tracker = OverlapTracker()
 
         await withTaskGroup(of: Void.self) { group in
-            for _ in 0 ..< 3 {
-                group.addTask {
-                    await withTaskExecutorPreference(serialExecutor) {
-                        expectation.fulfill()
-                    }
-                }
+            for _ in 0 ..< 8 {
+                group.addTask(executorPreference: executor) { tracker.occupy() }
             }
         }
 
-        await fulfillment(of: [expectation], timeout: 2.0)
-
-        // This test verifies that all tasks complete on the serial executor
-        // Note: Serial execution order might not be guaranteed due to Swift's cooperative threading
+        #expect(tracker.peak == 1)
     }
 
-    // MARK: - QoS Tests
+    @Test("The concurrent initializer overlaps jobs")
+    func concurrentQueueOverlaps() async {
+        let executor = DispatchQueueTaskExecutor(concurrentLabel: "test.dispatch.concurrent")
+        let tracker = OverlapTracker()
 
-    func testDifferentQoSLevels() async {
-        let qosLevels: [DispatchQoS] = [.userInteractive, .userInitiated, .default, .utility, .background]
-
-        for qos in qosLevels {
-            let qosExecutor = DispatchQueueTaskExecutor(label: "QOSTest", qos: qos)
-            let expectation = XCTestExpectation(description: "Task with QoS \(qos) should execute")
-
-            await withTaskExecutorPreference(qosExecutor) {
-                expectation.fulfill()
-            }
-
-            await fulfillment(of: [expectation], timeout: 1.0)
-        }
-    }
-
-    // MARK: - Task Group Integration Tests
-
-    func testTaskGroupWithExecutor() async throws {
-        let expectation = XCTestExpectation(description: "All tasks in group should execute")
-        expectation.expectedFulfillmentCount = 3
-
-        let results = try await withTaskExecutorPreference(executor) {
-            try await withThrowingTaskGroup(of: Int.self) { group in
-                for i in 1 ... 3 {
-                    group.addTask {
-                        expectation.fulfill()
-                        return i
-                    }
-                }
-
-                var results: [Int] = []
-                for try await result in group {
-                    results.append(result)
-                }
-                return results.sorted()
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0 ..< 8 {
+                group.addTask(executorPreference: executor) { tracker.occupy() }
             }
         }
 
-        await fulfillment(of: [expectation], timeout: 2.0)
-        XCTAssertEqual(results, [1, 2, 3], "Task group should return expected results")
+        #expect(tracker.peak > 1)
     }
 
-    // MARK: - Error Handling Tests
+    @Test("Each quality of service runs work", arguments: [
+        DispatchQoS.userInteractive, .userInitiated, .default, .utility, .background,
+    ])
+    func runsAtEveryQoS(qos: DispatchQoS) async {
+        let executor = DispatchQueueTaskExecutor(label: "test.dispatch.qos", qos: qos)
 
-    func testTaskGroupWithThrowingTasks() async {
-        let expectation = XCTestExpectation(description: "Error should be thrown from task group")
-
-        do {
-            _ = try await withTaskExecutorPreference(executor) {
-                try await withThrowingTaskGroup(of: Int.self) { group in
-                    group.addTask {
-                        throw TestError.testError
-                    }
-
-                    for try await _ in group {
-                        // This should not execute due to error
-                    }
-                    return []
-                }
-            }
-            XCTFail("Task group should throw an error")
-        } catch {
-            XCTAssertEqual(error as? TestError, TestError.testError, "Task group should throw expected error")
-            expectation.fulfill()
+        let label = await withTaskExecutorPreference(executor) {
+            await onPreferredExecutor { currentQueueLabel() }
         }
 
-        await fulfillment(of: [expectation], timeout: 1.0)
+        #expect(label == "test.dispatch.qos")
     }
 
-    // MARK: - Performance Tests
+    // MARK: - Results and errors
 
-    func testExecutorPerformance() async {
-        let performanceExecutor = DispatchQueueTaskExecutor(label: "PerformanceTest")
+    @Test("Returns the operation's value")
+    func returnsValue() async {
+        let executor = DispatchQueueTaskExecutor()
 
-        measure {
-            let expectation = XCTestExpectation(description: "Performance test")
-            expectation.expectedFulfillmentCount = 100
+        let result = await withTaskExecutorPreference(executor) { "Test Result" }
 
-            Task {
-                await withTaskGroup(of: Void.self) { group in
-                    for _ in 0 ..< 100 {
-                        group.addTask {
-                            await withTaskExecutorPreference(performanceExecutor) {
-                                expectation.fulfill()
-                            }
-                        }
-                    }
-                }
+        #expect(result == "Test Result")
+    }
+
+    @Test("Propagates a typed error from the operation")
+    func propagatesTypedError() async {
+        let executor = DispatchQueueTaskExecutor()
+
+        await #expect(throws: TestError.boom) {
+            try await withTaskExecutorPreference(executor) { () throws(TestError) in
+                throw .boom
             }
-
-            wait(for: [expectation], timeout: 5.0)
         }
     }
-}
 
-// MARK: - Test Error
+    @Test("Propagates an error from a child task")
+    func propagatesChildTaskError() async {
+        let executor = DispatchQueueTaskExecutor(concurrentLabel: "test.dispatch.throwing")
 
-private enum TestError: Error, Equatable {
-    case testError
+        await #expect(throws: TestError.boom) {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask(executorPreference: executor) { throw TestError.boom }
+                try await group.waitForAll()
+            }
+        }
+    }
 }

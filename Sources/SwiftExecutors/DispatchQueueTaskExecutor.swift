@@ -12,7 +12,7 @@ import Foundation
 /// thread pool. It's useful when you want to leverage GCD's efficient
 /// thread management, work with existing GCD-based code, or need the
 /// performance characteristics of dispatch queues.
-public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable {
+public final class DispatchQueueTaskExecutor: TaskExecutor {
     /// Private dispatch queue used as the underlying thread pool.
     private let queue: DispatchQueue
 
@@ -42,7 +42,7 @@ public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable 
     ///   - label: Human-readable name for debugging.
     ///   - qos: Quality of service for priority handling.
     ///   - target: Target queue for execution (nil for default).
-    public convenience init(concurrentLabel: String = "ConcurrentDispatchExec",
+    public convenience init(concurrentLabel: String,
                             qos: DispatchQoS = .default,
                             target: DispatchQueue? = nil)
     {
@@ -55,7 +55,7 @@ public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable 
     ///   - label: Human-readable name for debugging.
     ///   - qos: Quality of service for priority handling.
     ///   - target: Target queue for execution (nil for default).
-    public convenience init(serialLabel: String = "SerialDispatchExec",
+    public convenience init(serialLabel: String,
                             qos: DispatchQoS = .default,
                             target: DispatchQueue? = nil)
     {
@@ -64,25 +64,16 @@ public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable 
 
     /// Required protocol method — invoked by Swift runtime when a task is enqueued.
     ///
-    /// This method must be fast and non-blocking. We wrap the job in an `UnownedJob`,
-    /// and submit it asynchronously to the dispatch queue. Swift's runtime retains the
-    /// executor via the `UnownedTaskExecutor` so it can safely call into it.
+    /// This method must be fast and non-blocking. A noncopyable `ExecutorJob`
+    /// cannot be captured by an escaping closure, so we carry it across as an
+    /// `UnownedJob`; the runtime keeps the job alive until it has run.
     public func enqueue(_ job: consuming ExecutorJob) {
-        let exec = asUnownedTaskExecutor() // Stable, reusable reference to this executor
-        let unowned = UnownedJob(job) // Wrap the consuming job for lifecycle safety
+        let unownedJob = UnownedJob(job)
+        let executor = asUnownedTaskExecutor()
 
         queue.async {
-            // This block executes off the main thread.
-            // Since this is not actor-isolated, we pass nil for `isolatedTo`.
-            unowned.runSynchronously(on: exec)
+            // Not actor-isolated: the job runs with only this task executor.
+            unownedJob.runSynchronously(on: executor)
         }
-    }
-
-    /// Return a stable, identity-preserving executor reference.
-    ///
-    /// Swift requires this to keep long-term references to the executor
-    /// for equality checks and lifetime management.
-    public func asUnownedTaskExecutor() -> UnownedTaskExecutor {
-        UnownedTaskExecutor(ordinary: self)
     }
 }
