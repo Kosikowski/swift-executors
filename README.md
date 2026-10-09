@@ -11,16 +11,22 @@ Swift Executors provides three main executor types that allow you to control how
 
 - **QueueTaskExecutor**: A task executor backed by `NSOperationQueue` for controlling concurrency and prioritizing work
 - **DispatchQueueTaskExecutor**: A task executor backed by Grand Central Dispatch (GCD) for efficient thread management and performance
-- **ThreadExecutor**: A serial executor that pins every actor job to a dedicated thread for thread-affinity requirements
+- **ThreadExecutor**: A serial executor and task executor that runs every job on one dedicated thread, for thread-affinity requirements
 
 ## Features
 
 - **Concurrency Control**: Limit the number of concurrent operations with `QueueTaskExecutor`
 - **GCD Integration**: Leverage Grand Central Dispatch with `DispatchQueueTaskExecutor` for efficient thread management
-- **Thread Affinity**: Pin tasks to specific threads with `ThreadExecutor` for frameworks requiring thread-local storage
+- **Thread Affinity**: Pin an actor, or a task, to one thread with `ThreadExecutor` for frameworks requiring thread-local storage
+- **Isolation Checking**: `ThreadExecutor` implements `checkIsolated()` and `isIsolatingCurrentContext()`, so `assumeIsolated` works from callbacks on its thread
 - **Quality of Service**: Configure QoS levels for priority handling
 - **Swift Concurrency Integration**: Seamlessly works with Swift's async/await and structured concurrency
 - **Cross-Platform**: Supports iOS 18+ and macOS 15+
+
+## Requirements
+
+- Swift 6.2+ (Xcode 26+)
+- iOS 18+ / macOS 15+ (task executors need the Swift runtime that ships with these releases)
 
 ## Installation
 
@@ -100,22 +106,23 @@ func fetchData(urls: [URL]) async throws -> [Data] {
     }
 }
 
-// Create a serial executor for sequential operations
+// Create a serial executor: one job at a time, in submission order
 let serialExecutor = DispatchQueueTaskExecutor(
-    label: "SerialProcessor",
+    serialLabel: "SerialProcessor",
     qos: .utility
 )
 
-// Use it for operations that must be sequential
+// Use it for jobs that must never overlap
 func processSequentially(_ items: [String]) async -> [String] {
-    await withTaskExecutorPreference(serialExecutor) {
-        var results: [String] = []
+    await withTaskGroup(of: String.self) { group in
         for item in items {
-            // These run one after another on the same thread
-            let processed = await processItem(item)
-            results.append(processed)
+            group.addTask(executorPreference: serialExecutor) {
+                // Never runs at the same time as another job on this queue.
+                // GCD may still use a different thread for each job.
+                processItem(item)
+            }
         }
-        return results
+        return await group.reduce(into: []) { $0.append($1) }
     }
 }
 ```
@@ -127,28 +134,80 @@ Use `ThreadExecutor` when you need thread affinity for:
 - Frameworks that demand single-thread affinity (Core MIDI, Core Audio)
 - Real-time loops that must never hop between cores
 
+Back an actor with it to pin all of that actor's code to one thread:
+
 ```swift
 import SwiftExecutors
 
-// Create a dedicated thread executor
+actor AudioEngine {
+    private let executor = ThreadExecutor(name: "AudioThread")
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
+    func render() {
+        // Always runs on the "AudioThread" thread
+    }
+}
+```
+
+It is also a `TaskExecutor`, so nonisolated async code can prefer it:
+
+```swift
 let audioExecutor = ThreadExecutor(name: "AudioThread")
 
-// Use it for audio processing
 func processAudio() async {
     await withTaskExecutorPreference(audioExecutor) {
-        // This code runs on a dedicated thread
-        // Perfect for audio processing that requires thread affinity
+        // Nonisolated async code in here runs on the dedicated thread
         await processAudioBuffer()
     }
 }
 ```
+
+When a thread-affine library delivers a callback on that thread, outside any Swift task,
+`assumeIsolated` lets you touch the actor's state synchronously. `ThreadExecutor` confirms
+the caller is on its thread, and traps if it is not:
+
+```swift
+extension AudioEngine {
+    /// Called by the audio library on "AudioThread".
+    nonisolated func handleCallback() {
+        assumeIsolated { engine in
+            engine.render()
+        }
+    }
+}
+```
+
+### Swift 6.2: `nonisolated(nonsending)` and `@concurrent`
+
+This package enables the `NonisolatedNonsendingByDefault` upcoming feature (SE-0461).
+With it, a `nonisolated async` function runs on its **caller's** executor. Called from
+an actor, it stays on that actor and never reaches the preferred task executor.
+
+Mark work that should move to the preferred executor `@concurrent`:
+
+```swift
+@concurrent
+func resize(_ image: CGImage) async -> CGImage {
+    // Runs on the task's preferred executor, or the global pool if none is set
+}
+
+await withTaskExecutorPreference(imageProcessor) {
+    let thumbnail = await resize(image)
+}
+```
+
+Child tasks (`group.addTask`) and `Task(executorPreference:)` closures that are not
+isolated to an actor always run on the preferred executor.
 
 ## API Reference
 
 ### QueueTaskExecutor
 
 ```swift
-public final class QueueTaskExecutor: TaskExecutor, @unchecked Sendable {
+public final class QueueTaskExecutor: TaskExecutor {
     public init(
         label: String = "TaskExec",
         maxConcurrent: Int = OperationQueue.defaultMaxConcurrentOperationCount,
@@ -165,7 +224,7 @@ public final class QueueTaskExecutor: TaskExecutor, @unchecked Sendable {
 ### DispatchQueueTaskExecutor
 
 ```swift
-public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable {
+public final class DispatchQueueTaskExecutor: TaskExecutor {
     public init(
         label: String = "DispatchTaskExec",
         qos: DispatchQoS = .default,
@@ -174,13 +233,13 @@ public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable 
     )
     
     // Convenience initializers
-    public convenience init(concurrentLabel: String = "ConcurrentDispatchExec",
-                           qos: DispatchQoS = .default,
-                           target: DispatchQueue? = nil)
+    public convenience init(concurrentLabel: String,
+                            qos: DispatchQoS = .default,
+                            target: DispatchQueue? = nil)
     
-    public convenience init(serialLabel: String = "SerialDispatchExec",
-                           qos: DispatchQoS = .default,
-                           target: DispatchQueue? = nil)
+    public convenience init(serialLabel: String,
+                            qos: DispatchQoS = .default,
+                            target: DispatchQueue? = nil)
 }
 ```
 
@@ -193,13 +252,21 @@ public final class DispatchQueueTaskExecutor: TaskExecutor, @unchecked Sendable 
 ### ThreadExecutor
 
 ```swift
-public final class ThreadExecutor: SerialExecutor, @unchecked Sendable {
+public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Sendable {
     public init(name: String = "ThreadExecutor")
+
+    // Isolation checks used by assumeIsolated / preconditionIsolated
+    public func checkIsolated()
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *)
+    public func isIsolatingCurrentContext() -> Bool?
 }
 ```
 
 **Parameters:**
 - `name`: Human-readable thread name for debugging
+
+The thread starts in `init` and stops once the executor is released, after the jobs
+already queued on it have run.
 
 ## Examples
 
@@ -212,7 +279,7 @@ let imageProcessor = QueueTaskExecutor(
     qos: .background
 )
 
-func processImages(_ images: [UIImage]) async -> [UIImage] {
+func processImages(_ images: [UIImage]) async throws -> [UIImage] {
     try await withTaskExecutorPreference(imageProcessor) {
         try await withThrowingTaskGroup(of: UIImage.self) { group in
             for image in images {
@@ -256,13 +323,13 @@ func downloadMultipleFiles(_ urls: [URL]) async throws -> [Data] {
 ```swift
 let audioThread = ThreadExecutor(name: "AudioProcessor")
 
-func startAudioProcessing() async {
-    await withTaskExecutorPreference(audioThread) {
+func startAudioProcessing() async throws {
+    try await withTaskExecutorPreference(audioThread) {
         // All audio processing happens on the same thread
         // This prevents audio glitches from thread hopping
         while isProcessing {
             await processAudioFrame()
-            await sleep(1.0 / sampleRate)
+            try await Task.sleep(for: .seconds(1.0 / sampleRate))
         }
     }
 }
