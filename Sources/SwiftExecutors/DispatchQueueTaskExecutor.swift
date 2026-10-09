@@ -21,7 +21,8 @@ public final class DispatchQueueTaskExecutor: TaskExecutor {
     /// - Parameters:
     ///   - label: Human-readable name for debugging (Instruments/Xcode).
     ///   - qos: Quality of service for priority handling.
-    ///   - attributes: Queue attributes (e.g., `.concurrent`, `.initiallyInactive`).
+    ///   - attributes: Queue attributes, e.g. `.concurrent`. The queue starts
+    ///     active even if `.initiallyInactive` is passed.
     ///   - target: Target queue for execution (nil for default).
     public init(label: String = "DispatchTaskExec",
                 qos: DispatchQoS = .default,
@@ -34,6 +35,10 @@ public final class DispatchQueueTaskExecutor: TaskExecutor {
             attributes: attributes,
             target: target
         )
+        // The queue is private, so callers could never activate an
+        // `.initiallyInactive` one and its jobs would never run. Activating
+        // an already active queue has no effect.
+        queue.activate()
     }
 
     /// Convenience initializer for creating a concurrent queue with specific QoS.

@@ -18,7 +18,7 @@ Swift Executors provides three main executor types that allow you to control how
 - **Concurrency Control**: Limit the number of concurrent operations with `QueueTaskExecutor`
 - **GCD Integration**: Leverage Grand Central Dispatch with `DispatchQueueTaskExecutor` for efficient thread management
 - **Thread Affinity**: Pin an actor, or a task, to one thread with `ThreadExecutor` for frameworks requiring thread-local storage
-- **Isolation Checking**: `ThreadExecutor` implements `checkIsolated()` and `isIsolatingCurrentContext()`, so `assumeIsolated` works from callbacks on its thread
+- **Isolation Checking**: `ThreadExecutor` implements `checkIsolated()` and `isIsolatingCurrentContext()`, so `assumeIsolated` works from callbacks on its thread (see [ThreadExecutor](#threadexecutor) for the one exception)
 - **Quality of Service**: Configure QoS levels for priority handling
 - **Swift Concurrency Integration**: Seamlessly works with Swift's async/await and structured concurrency
 - **Cross-Platform**: Supports iOS 18+ and macOS 15+
@@ -112,17 +112,17 @@ let serialExecutor = DispatchQueueTaskExecutor(
     qos: .utility
 )
 
-// Use it for jobs that must never overlap
+// Use it for work that must run one item at a time
 func processSequentially(_ items: [String]) async -> [String] {
-    await withTaskGroup(of: String.self) { group in
+    await withTaskExecutorPreference(serialExecutor) {
+        var results: [String] = []
         for item in items {
-            group.addTask(executorPreference: serialExecutor) {
-                // Never runs at the same time as another job on this queue.
-                // GCD may still use a different thread for each job.
-                processItem(item)
-            }
+            // One item at a time, in order, on the serial queue. GCD may use
+            // a different thread for each job, so don't rely on thread identity.
+            let processed = await processItem(item)
+            results.append(processed)
         }
-        return await group.reduce(into: []) { $0.append($1) }
+        return results
     }
 }
 ```
@@ -159,15 +159,24 @@ let audioExecutor = ThreadExecutor(name: "AudioThread")
 
 func processAudio() async {
     await withTaskExecutorPreference(audioExecutor) {
-        // Nonisolated async code in here runs on the dedicated thread
+        // Written outside any actor, so this closure - and the nonisolated
+        // async functions it calls - runs on the dedicated thread
         await processAudioBuffer()
     }
 }
 ```
 
+Write such closures outside actor-isolated code; see
+[`nonisolated(nonsending)` and `@concurrent`](#swift-62-nonisolatednonsending-and-concurrent).
+
 When a thread-affine library delivers a callback on that thread, outside any Swift task,
 `assumeIsolated` lets you touch the actor's state synchronously. `ThreadExecutor` confirms
-the caller is on its thread, and traps if it is not:
+the caller is on its thread, and traps if it is not.
+
+The runtime only asks the executor when the process's main executable was linked against
+the macOS 15 / iOS 18 SDK or later, which every app built with Xcode 26 is. In a plugin
+loaded by an older host app, `assumeIsolated` from a callback can trap even on the right
+thread.
 
 ```swift
 extension AudioEngine {
@@ -183,10 +192,17 @@ extension AudioEngine {
 ### Swift 6.2: `nonisolated(nonsending)` and `@concurrent`
 
 This package enables the `NonisolatedNonsendingByDefault` upcoming feature (SE-0461).
-With it, a `nonisolated async` function runs on its **caller's** executor. Called from
-an actor, it stays on that actor and never reaches the preferred task executor.
+With it, a `nonisolated async` function runs on its **caller's** executor.
 
-Mark work that should move to the preferred executor `@concurrent`:
+That decides where the closure you pass to `withTaskExecutorPreference` runs:
+
+- **Written in nonisolated code** (a free function, a `nonisolated` method), the closure
+  runs on the preferred executor, and so do the nonisolated async functions it calls.
+- **Written in actor-isolated code** (for example a `@MainActor` method), the closure stays
+  on that actor, and so do the nonisolated async functions it calls. Only `@concurrent`
+  functions move to the preferred executor.
+
+Mark work that should always move to the preferred executor `@concurrent`:
 
 ```swift
 @concurrent
@@ -246,7 +262,7 @@ public final class DispatchQueueTaskExecutor: TaskExecutor {
 **Parameters:**
 - `label`: Human-readable name for debugging (shows up in Instruments/Xcode)
 - `qos`: Quality of service for priority handling
-- `attributes`: Queue attributes (e.g., `.concurrent`, `.initiallyInactive`)
+- `attributes`: Queue attributes, e.g. `.concurrent`. The queue starts active even if `.initiallyInactive` is passed
 - `target`: Target queue for execution (nil for default)
 
 ### ThreadExecutor
@@ -267,6 +283,14 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 
 The thread starts in `init` and stops once the executor is released, after the jobs
 already queued on it have run.
+
+Jobs never run inside one another. If a job spins the thread's run loop, as some legacy
+APIs do while they wait for a callback, run-loop sources and callbacks still fire, but
+other jobs wait until that job returns. Code on the thread that calls `CFRunLoopStop`
+does not stop the executor.
+
+Every job runs isolated to the executor, so a call from it to a `@concurrent` function
+goes back through the run loop instead of continuing inline.
 
 ## Examples
 
@@ -325,8 +349,8 @@ let audioThread = ThreadExecutor(name: "AudioProcessor")
 
 func startAudioProcessing() async throws {
     try await withTaskExecutorPreference(audioThread) {
-        // All audio processing happens on the same thread
-        // This prevents audio glitches from thread hopping
+        // Written outside any actor, so all audio processing happens on
+        // the same thread. This prevents audio glitches from thread hopping
         while isProcessing {
             await processAudioFrame()
             try await Task.sleep(for: .seconds(1.0 / sampleRate))

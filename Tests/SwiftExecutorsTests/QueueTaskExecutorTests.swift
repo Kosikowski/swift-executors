@@ -50,8 +50,7 @@ struct QueueTaskExecutorTests {
             }
         }
 
-        #expect(tracker.peak <= limit)
-        #expect(tracker.peak == limit || limit == 1)
+        #expect(tracker.peak == limit)
     }
 
     @Test("Runs many short tasks to completion")

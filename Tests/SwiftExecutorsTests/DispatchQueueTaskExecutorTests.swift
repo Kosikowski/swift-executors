@@ -63,6 +63,17 @@ struct DispatchQueueTaskExecutorTests {
         #expect(value == "target")
     }
 
+    @Test("An initially inactive queue still runs jobs")
+    func initiallyInactiveQueueRuns() async {
+        let executor = DispatchQueueTaskExecutor(label: "test.dispatch.inactive", attributes: .initiallyInactive)
+
+        let label = await withTaskExecutorPreference(executor) {
+            await onPreferredExecutor { currentQueueLabel() }
+        }
+
+        #expect(label == "test.dispatch.inactive")
+    }
+
     // MARK: - Serial vs concurrent
 
     @Test("The serial initializer never overlaps jobs")

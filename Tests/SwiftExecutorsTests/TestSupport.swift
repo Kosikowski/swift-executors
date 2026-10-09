@@ -6,7 +6,40 @@
 //
 import Dispatch
 import Foundation
+import MachO
 import Synchronization
+
+/// Whether this process's main executable was linked against the macOS 15 /
+/// iOS 18 SDK or later.
+///
+/// The Swift runtime checks this before it lets `assumeIsolated` consult a
+/// custom executor. For an older host it uses a legacy check, which - depending
+/// on the toolchain that compiled the call - can trap even on the executor's
+/// own thread. swiftly's `swiftpm-testing-helper` is linked against SDK 14.
+let hostLinkedAgainstModernSDK: Bool = {
+    guard let header = _dyld_get_image_header(0), header.pointee.magic == MH_MAGIC_64 else {
+        return true
+    }
+    var command = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
+    for _ in 0 ..< header.pointee.ncmds {
+        let load = command.load(as: load_command.self)
+        if load.cmd == UInt32(LC_BUILD_VERSION) {
+            let build = command.load(as: build_version_command.self)
+            let sdkMajor = build.sdk >> 16 // Encoded as xxxx.yy.zz
+            switch Int32(build.platform) {
+            case PLATFORM_MACOS:
+                return sdkMajor >= 15
+            case PLATFORM_IOS, PLATFORM_IOSSIMULATOR, PLATFORM_MACCATALYST, PLATFORM_TVOS, PLATFORM_TVOSSIMULATOR:
+                return sdkMajor >= 18
+            default:
+                return true
+            }
+        }
+        command = command.advanced(by: Int(load.cmdsize))
+    }
+    // No LC_BUILD_VERSION: linked by a toolchain that predates it.
+    return false
+}()
 
 /// Label of the dispatch queue running the caller.
 func currentQueueLabel() -> String {
