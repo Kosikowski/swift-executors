@@ -26,10 +26,10 @@ jobs:
           - name: Swift 6.2 (Xcode 26.0)
             runner: macos-26
             xcode: Xcode_26.0.1
-            # Compile the iOS tests only: the simulator runtimes on this
-            # image (iOS 26.2+) are newer than Xcode 26.0's SDK.
-            ios-action: build-for-testing
-            ios-destination: generic/platform=iOS Simulator
+            # xcodebuild on this image accepts no simulator destination for
+            # Xcode 26.0, whose runtimes it lacks (the installed ones are
+            # 26.2 and later), so the iOS tests only compile on this leg.
+            simulator-tests: false
           - name: Swift 6.4 (Xcode 27.0)
             # GitHub's hosted Xcode 27 preview image, which installs Xcode
             # 27.0 at /Applications/Xcode_27.app. See "Xcode 27" in
@@ -38,8 +38,7 @@ jobs:
             # label may then be retired.
             runner: xcode-27
             xcode: Xcode_27
-            ios-action: test
-            ios-destination: platform=iOS Simulator,name=iPhone 17,OS=latest
+            simulator-tests: true
     env:
       DEVELOPER_DIR: /Applications/${{ matrix.xcode }}.app/Contents/Developer
     steps:
@@ -60,22 +59,24 @@ jobs:
         run: swift test --skip-build
       - name: Run CLI demo
         run: swift run SwiftExecutorsCLI
-      - name: iOS Simulator
+      - name: Test (iOS Simulator)
+        if: ${{ matrix.simulator-tests }}
         run: |
-          xcodebuild ${{ matrix.ios-action }} \
+          xcodebuild test \
             -scheme SwiftExecutors-Package \
-            -destination '${{ matrix.ios-destination }}'
+            -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
       # The other platforms only need to compile: their runtime behaviour
       # is the same Swift runtime the macOS and iOS legs exercise.
       # SwiftPM compiles against the SDKs inside the selected Xcode and
-      # needs no simulator runtime. xcodebuild rejects a simulator
-      # destination for a platform whose runtime is not installed for the
-      # selected Xcode, and the macos-26 image has no visionOS runtime and
-      # none that Xcode 26.0 accepts for tvOS or watchOS.
-      - name: Build for tvOS, watchOS and visionOS simulators
+      # needs no simulator runtime, unlike an xcodebuild destination.
+      # --sdk is needed on Swift 6.2, whose SwiftPM otherwise keeps the
+      # macOS SDK; Swift 6.4 derives it from the triple.
+      - name: Build for the iOS, tvOS, watchOS and visionOS simulators
         run: |
-          for triple in arm64-apple-tvos-simulator arm64-apple-watchos-simulator arm64-apple-xros-simulator; do
-            swift build --build-tests --triple "$triple"
+          for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator xros:xrsimulator; do
+            swift build --build-tests \
+              --triple "arm64-apple-${platform%%:*}-simulator" \
+              --sdk "$(xcrun --sdk "${platform##*:}" --show-sdk-path)"
           done
 
   # Formatting, against the .swiftformat config in the repository root.
