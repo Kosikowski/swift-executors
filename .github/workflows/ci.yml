@@ -67,12 +67,15 @@ jobs:
             -destination '${{ matrix.ios-destination }}'
       # The other platforms only need to compile: their runtime behaviour
       # is the same Swift runtime the macOS and iOS legs exercise.
+      # SwiftPM compiles against the SDKs inside the selected Xcode and
+      # needs no simulator runtime. xcodebuild rejects a simulator
+      # destination for a platform whose runtime is not installed for the
+      # selected Xcode, and the macos-26 image has no visionOS runtime and
+      # none that Xcode 26.0 accepts for tvOS or watchOS.
       - name: Build for tvOS, watchOS and visionOS simulators
         run: |
-          for platform in 'tvOS Simulator' 'watchOS Simulator' 'visionOS Simulator'; do
-            xcodebuild build-for-testing \
-              -scheme SwiftExecutors-Package \
-              -destination "generic/platform=$platform"
+          for triple in arm64-apple-tvos-simulator arm64-apple-watchos-simulator arm64-apple-xros-simulator; do
+            swift build --build-tests --triple "$triple"
           done
 
   # Formatting, against the .swiftformat config in the repository root.
