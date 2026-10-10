@@ -21,9 +21,17 @@ import Synchronization
 ///     `Task(executorPreference:)` or `group.addTask(executorPreference:)`,
 ///     so nonisolated async code runs on the thread too.
 ///
+/// Jobs run in batches, one batch per pass of the thread's run loop, so the
+/// run loop's timers, ports and other sources keep firing however busy the
+/// executor is.
+///
 /// Jobs never run inside one another. If a job spins the thread's run loop,
 /// as some legacy APIs do while they wait for a callback, run-loop sources and
-/// callbacks still fire, but other jobs wait until that job returns.
+/// callbacks still fire, but other jobs wait until that job returns. So a job
+/// that spins while it waits for another job on this executor, such as a
+/// `Task` that calls an actor backed by it, waits until it gives up. Have the
+/// callback reach the actor with `assumeIsolated`, `await` the result rather
+/// than spin, or let jobs run inside the spin with `allowingNestedJobs(_:)`.
 ///
 /// Every job runs isolated to this executor, so a call from it to a
 /// `@concurrent` function goes back through the run loop instead of
@@ -39,9 +47,6 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
     /// Owns the thread's run loop and the jobs waiting for it.
     private let worker: Worker
 
-    /// The worker thread's POSIX identity, used for cheap isolation checks.
-    private let threadID: pthread_t
-
     /// Exposes the thread for testing purposes only.
     @_spi(ThreadExecutorTesting)
     public var testThread: Thread {
@@ -52,6 +57,12 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
     @_spi(ThreadExecutorTesting)
     public var testRunLoop: CFRunLoop {
         worker.runLoop
+    }
+
+    /// Exposes the number of jobs waiting for the thread, for testing purposes only.
+    @_spi(ThreadExecutorTesting)
+    public var testQueuedJobCount: Int {
+        worker.queuedJobCount
     }
 
     /// Spins up the thread & run-loop pair exactly once.
@@ -76,7 +87,6 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 
         self.thread = thread
         self.worker = worker
-        threadID = worker.threadID
     }
 
     /// Called by the Swift runtime every time a job arrives, whether it is
@@ -87,9 +97,31 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
     public func enqueue(_ job: consuming ExecutorJob) {
         // A noncopyable `ExecutorJob` cannot be stored in the queue, so carry
         // it as an `UnownedJob`; the runtime keeps the job alive until it has
-        // run. The queue also holds `self`, so the executor outlives every
-        // job queued on it.
-        worker.submit(.job(UnownedJob(job), self))
+        // run. While jobs are queued or running the queue also holds `self`,
+        // so the executor outlives every job queued on it.
+        worker.submit(UnownedJob(job), on: self)
+    }
+
+    /// Runs `body`, letting other jobs on this executor run whenever `body`
+    /// spins the thread's run loop in the default mode.
+    ///
+    /// Jobs normally never run inside one another, so a job that spins the
+    /// run loop until another job on this executor has run waits forever:
+    /// for example, a call to a legacy API that runs the run loop until its
+    /// reply arrives, when the reply reaches it through a `Task` or an actor
+    /// backed by this executor. Wrap such a call in this method to let the
+    /// waiting jobs run inside it.
+    ///
+    /// Use it only where the calling job's state is consistent: as at an
+    /// `await`, any code isolated to this executor - the calling actor's own
+    /// methods included - may run before `body` returns. Jobs that run inside
+    /// `body` do not let further jobs run inside themselves unless they call
+    /// this method too.
+    ///
+    /// Must be called on the executor's thread.
+    public func allowingNestedJobs<T, E: Error>(_ body: () throws(E) -> T) throws(E) -> T {
+        precondition(isCurrentThread, "allowingNestedJobs must be called on the '\(thread.name ?? "ThreadExecutor")' thread")
+        return try worker.allowingNestedJobs(body)
     }
 
     /// Reports whether the caller is running on this executor's thread.
@@ -115,128 +147,255 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
     }
 
     private var isCurrentThread: Bool {
-        pthread_equal(pthread_self(), threadID) != 0
+        worker.isCurrentThread
     }
 
     deinit {
-        // Queued jobs hold the executor, so none are left by now. The stop
-        // goes through the same queue as jobs, so it never lands inside one.
-        worker.submit(.stop)
-
         // Mark the thread as cancelled so well-behaved APIs can bail out.
         thread.cancel()
+
+        // The queue holds the executor while it has jobs, so none are queued
+        // or running by now. This may run on the worker thread itself, when
+        // the queue let go of the last reference.
+        worker.requestStop()
     }
 }
 
-/// Runs queued work on the worker thread, one item at a time.
+/// Runs jobs on the worker thread, one batch per pass of its run loop.
 ///
-/// `pending` is shared between threads behind a mutex. `isDraining`,
-/// `isStopped` and `keepAlive` are touched only on the worker thread.
-/// `runLoop` and `threadID` are written once on the worker thread before
-/// `ready` is signalled, and read elsewhere only after `waitUntilReady()`.
+/// `queue` and `stopRequested` are shared between threads. `isDraining`,
+/// `unstarted`, `allowsNestedJobs`, `depth`, `hasStoppedNestedRun` and
+/// `isStopped` are touched only on the worker thread. `runLoop`, `threadID`
+/// and `source` are written once on the worker thread before `ready` is
+/// signalled, and read elsewhere only after `waitUntilReady()`.
 private final class Worker: @unchecked Sendable {
-    enum Work: Sendable {
-        /// A job and the executor it runs on, kept alive until the job has run.
-        case job(UnownedJob, ThreadExecutor)
-        case stop
+    /// Jobs waiting for the thread, and the executor they run on.
+    struct Queue {
+        var jobs: [UnownedJob] = []
+
+        /// Set while jobs are queued or running, so that none of them runs
+        /// against a freed executor.
+        var owner: ThreadExecutor?
     }
 
     private(set) var runLoop: CFRunLoop!
     private(set) var threadID: pthread_t!
 
+    /// Signalled while jobs are waiting; its callout runs them. Being a
+    /// source, it also keeps the run loop from finishing while it is idle.
+    private var source: CFRunLoopSource!
+
     private let ready = DispatchSemaphore(value: 0)
-    private let pending = Mutex<[Work]>([])
-    private var keepAlive: CFRunLoopSource!
+    private let queue = Mutex(Queue())
+    private let stopRequested = Atomic(false)
     private var isDraining = false
+
+    /// The jobs of the running batch that have not started yet.
+    private var unstarted: ArraySlice<UnownedJob> = []
+
+    /// Whether the job running now lets other jobs run inside it.
+    private var allowsNestedJobs = false
+
     private var isStopped = false
+
+    /// Whether a stop request has already stopped a nested run once.
+    private var hasStoppedNestedRun = false
+
+    /// How many default-mode runs of the run loop are in progress. 1 means
+    /// only the thread's own run; more means code on the thread is running
+    /// the run loop again from inside it.
+    private var depth = 0
+
+    var isCurrentThread: Bool {
+        pthread_equal(pthread_self(), threadID) != 0
+    }
+
+    var queuedJobCount: Int {
+        queue.withLock { $0.jobs.count }
+    }
 
     /// The worker thread's body.
     func run() {
         runLoop = CFRunLoopGetCurrent()
         threadID = pthread_self()
 
-        // A run loop with no sources returns from CFRunLoopRun() at once,
-        // which would let the thread exit before any job arrives. This
-        // never-signalled source keeps it parked until stop().
+        // The source refers to the worker without retaining it. It cannot
+        // call back once the worker is gone: it is invalidated before
+        // `run()` returns.
         var context = CFRunLoopSourceContext()
-        context.perform = { _ in }
-        keepAlive = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context)
-        CFRunLoopAddSource(runLoop, keepAlive, .defaultMode)
+        context.info = Unmanaged.passUnretained(self).toOpaque()
+        context.perform = { info in
+            Unmanaged<Worker>.fromOpaque(info!).takeUnretainedValue().drain()
+        }
+        source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context)
+        CFRunLoopAddSource(runLoop, source, .defaultMode)
+
+        let activities: CFRunLoopActivity = [.entry, .beforeSources, .beforeWaiting, .exit]
+        let observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, activities.rawValue, true, 0) { _, activity in
+            self.observe(activity)
+        }
+        CFRunLoopAddObserver(runLoop, observer, .defaultMode)
 
         ready.signal()
 
         // CFRunLoopRun() also returns when code on this thread calls
-        // CFRunLoopStop(); only stop() may end the thread.
+        // CFRunLoopStop(); only stopIfRequested() may end the thread.
         while !isStopped {
             CFRunLoopRun()
         }
+
+        // Nothing calls into the worker once these are gone, and nothing
+        // left on the run loop refers to it.
+        CFRunLoopObserverInvalidate(observer)
+        CFRunLoopSourceInvalidate(source)
     }
 
     func waitUntilReady() {
         ready.wait()
     }
 
-    /// Queues `work` and makes sure a drain is scheduled. Callable from any thread.
-    func submit(_ work: Work) {
-        let wasEmpty = pending.withLock { queue in
-            queue.append(work)
-            return queue.count == 1
+    /// Queues `job` to run on `executor` and makes sure a drain is due.
+    /// Callable from any thread.
+    func submit(_ job: UnownedJob, on executor: ThreadExecutor) {
+        let wasIdle = queue.withLock { queue in
+            queue.jobs.append(job)
+            if queue.owner == nil {
+                queue.owner = executor
+            }
+            return queue.jobs.count == 1
         }
-        // While the queue is non-empty a drain is already scheduled or running.
-        guard wasEmpty else { return }
+        // While jobs are waiting a drain is already due: the source is
+        // signalled, or a drain is running and checks the queue once its
+        // batch is done. A job queued from inside that drain is left to
+        // that check too, unless the running job lets jobs in before then.
+        guard wasIdle, !(isCurrentThread && isDraining && !allowsNestedJobs) else { return }
 
-        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
-            self.drain()
-        }
+        CFRunLoopSourceSignal(source)
         // In case the run-loop is napping, prod it so it wakes up soon.
         CFRunLoopWakeUp(runLoop)
     }
 
-    /// Runs queued work in order.
-    ///
-    /// Never nests: if a job spins the run loop, the drain blocks that fire
-    /// inside that spin return at once, and this loop picks up their work
-    /// when the job returns.
-    private func drain() {
-        guard !isDraining, !isStopped else { return }
-        isDraining = true
-        defer { isDraining = false }
+    /// Runs `body`, letting other jobs run inside the current job whenever
+    /// `body` spins the run loop. Callable only on the worker thread.
+    func allowingNestedJobs<T, E: Error>(_ body: () throws(E) -> T) throws(E) -> T {
+        let allowed = allowsNestedJobs
+        allowsNestedJobs = true
+        defer { allowsNestedJobs = allowed }
+        if isDraining {
+            // The jobs behind this one in its batch go back to the front of
+            // the queue, and with those queued since, may now run inside it.
+            let behind = unstarted
+            unstarted = []
+            let hasWaiting = queue.withLock { queue in
+                queue.jobs.insert(contentsOf: behind, at: 0)
+                return !queue.jobs.isEmpty
+            }
+            if hasWaiting {
+                CFRunLoopSourceSignal(source)
+            }
+        }
+        return try body()
+    }
 
-        while true {
-            let batch = pending.withLock { queue in
-                var batch: [Work] = []
-                swap(&batch, &queue)
-                return batch
+    /// Asks the thread to finish. Callable from any thread, this one included.
+    func requestStop() {
+        stopRequested.store(true, ordering: .releasing)
+        // Guarantees the run loop another pass, in which stopIfRequested() runs.
+        CFRunLoopSourceSignal(source)
+        CFRunLoopWakeUp(runLoop)
+    }
+
+    /// Runs the jobs queued so far. Jobs queued meanwhile run in the next
+    /// pass of the run loop, after it has serviced its timers and ports.
+    ///
+    /// Never nests unless the running job allows it: if a job spins the run
+    /// loop, the drains that fire inside that spin return at once, and the
+    /// jobs wait until that job returns.
+    private func drain() {
+        guard !isDraining || allowsNestedJobs else { return }
+        let isNested = isDraining
+
+        // Unowned references only: the owner keeps the executor alive until
+        // the batch has run.
+        let (batch, executors) = queue.withLock { queue in
+            var batch: [UnownedJob] = []
+            swap(&batch, &queue.jobs)
+            return (batch, queue.owner.map { ($0.asUnownedSerialExecutor(), $0.asUnownedTaskExecutor()) })
+        }
+        // Every queued job sets the owner, so no owner means no jobs: the
+        // signal came from a stop request, or its jobs ran in an earlier pass.
+        guard let (serialExecutor, taskExecutor) = executors else { return }
+
+        // A drain inside a job runs only once that job has put the rest of
+        // its batch back in the queue.
+        assert(unstarted.isEmpty, "A drain started with jobs of another batch left")
+        let allowedNestedJobs = allowsNestedJobs
+        unstarted = batch[...]
+        isDraining = true
+        // Each job decides for itself whether jobs may run inside it.
+        allowsNestedJobs = false
+        // Running with both roles makes each job isolated to the serial
+        // executor *and* keeps the task's executor preference pointed at
+        // this thread. `runSynchronously` runs & *removes* the job exactly
+        // once.
+        while let job = unstarted.popFirst() {
+            job.runSynchronously(isolatedTo: serialExecutor, taskExecutor: taskExecutor)
+        }
+        isDraining = isNested
+        allowsNestedJobs = allowedNestedJobs
+
+        let (hasMore, released) = queue.withLock { queue -> (Bool, ThreadExecutor?) in
+            if !queue.jobs.isEmpty {
+                return (true, nil)
             }
-            if batch.isEmpty {
-                return
+            // A nested drain leaves the owner to the drain around it, whose
+            // batch is still running.
+            return (false, isNested ? nil : queue.owner.take())
+        }
+        if hasMore {
+            // This callout is still running, so the run loop polls rather
+            // than sleeps before its next pass: no need to wake it up.
+            CFRunLoopSourceSignal(source)
+        }
+        // Dropping the last reference to the executor runs its deinit here,
+        // on the worker thread.
+        withExtendedLifetime(released) {}
+    }
+
+    /// Tracks how deeply the run loop is nested, and stops it when asked.
+    private func observe(_ activity: CFRunLoopActivity) {
+        switch activity {
+        case .entry:
+            depth += 1
+        case .exit:
+            depth -= 1
+            // Back in the thread's own run, which may go to sleep without
+            // another pass if this nested run was started from an observer.
+            if depth == 1, stopRequested.load(ordering: .acquiring) {
+                CFRunLoopWakeUp(runLoop)
             }
-            for work in batch {
-                switch work {
-                case let .job(job, executor):
-                    // Running with both roles makes the job isolated to the
-                    // serial executor *and* keeps the task's executor
-                    // preference pointed at this thread. `runSynchronously`
-                    // runs & *removes* the job exactly once.
-                    job.runSynchronously(
-                        isolatedTo: executor.asUnownedSerialExecutor(),
-                        taskExecutor: executor.asUnownedTaskExecutor()
-                    )
-                case .stop:
-                    stop()
-                    return
-                }
-            }
+        default:
+            stopIfRequested()
         }
     }
 
-    /// Makes the outer `CFRunLoopRun()` return for good, ending the thread.
-    private func stop() {
-        isStopped = true
-        // Without the keep-alive source the run loop also finishes on its own
-        // if this stop lands in a nested run started outside any job.
-        CFRunLoopRemoveSource(runLoop, keepAlive, .defaultMode)
-        CFRunLoopStop(runLoop)
+    /// Ends the thread's own run for good once a stop has been requested.
+    ///
+    /// If a callback on this thread is running the run loop in the default
+    /// mode at that moment, its run is stopped once, the way `CFRunLoopStop()`
+    /// asks whoever runs the run loop to return, so a callback that runs it
+    /// until stopped returns too. Later runs are left alone: stopping each of
+    /// them would keep a callback that polls the run loop from ever sleeping.
+    /// The thread's own run stops in its first pass after the callback returns.
+    private func stopIfRequested() {
+        guard !isStopped, stopRequested.load(ordering: .acquiring) else { return }
+        if depth == 1 {
+            isStopped = true
+            CFRunLoopStop(runLoop)
+        } else if !hasStoppedNestedRun {
+            hasStoppedNestedRun = true
+            CFRunLoopStop(runLoop)
+        }
     }
 }
 

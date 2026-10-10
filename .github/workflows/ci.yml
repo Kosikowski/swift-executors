@@ -32,6 +32,11 @@ jobs:
             ios-action: build-for-testing
             ios-destination: generic/platform=iOS Simulator
           - name: Swift 6.4 (Xcode 27.0)
+            # GitHub's hosted Xcode 27 preview image, which installs Xcode
+            # 27.0 at /Applications/Xcode_27.app. See "Xcode 27" in
+            # https://github.com/actions/runner-images. Move this leg to the
+            # regular macOS image once that ships Xcode 27, as the preview
+            # label may then be retired.
             runner: xcode-27
             xcode: Xcode_27
             ios-action: test
@@ -40,6 +45,12 @@ jobs:
       DEVELOPER_DIR: /Applications/${{ matrix.xcode }}.app/Contents/Developer
     steps:
       - uses: actions/checkout@v7
+      - name: Check the selected Xcode is installed
+        run: |
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            echo "::error::$DEVELOPER_DIR is not on this runner image. Installed: $(ls -d /Applications/Xcode*.app | xargs)"
+            exit 1
+          fi
       - name: Show versions
         run: |
           xcodebuild -version

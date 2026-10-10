@@ -17,7 +17,12 @@ import Synchronization
 /// on the toolchain that compiled the call - can trap even on the executor's
 /// own thread. swiftly's `swiftpm-testing-helper` is linked against SDK 14.
 let hostLinkedAgainstModernSDK: Bool = {
-    guard let header = _dyld_get_image_header(0), header.pointee.magic == MH_MAGIC_64 else {
+    // Not necessarily image 0: libraries inserted at launch, such as the
+    // Thread Sanitizer runtime, come before the main executable.
+    let images = (0 ..< _dyld_image_count()).lazy.compactMap { _dyld_get_image_header($0) }
+    guard let header = images.first(where: { $0.pointee.filetype == UInt32(MH_EXECUTE) }),
+          header.pointee.magic == MH_MAGIC_64
+    else {
         return true
     }
     var command = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
@@ -63,6 +68,42 @@ func currentThreadName() -> String? {
 @concurrent
 func onPreferredExecutor<T: Sendable>(_ body: @Sendable () -> T) async -> T {
     body()
+}
+
+/// Waits up to `timeout` for `condition` to hold and reports whether it did.
+func waitUntil(timeout: Duration = .seconds(2), _ condition: () -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while !condition(), ContinuousClock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return condition()
+}
+
+/// The process's physical memory footprint in bytes, as Activity Monitor
+/// reports it.
+func physicalFootprint() -> Int {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) { info in
+        info.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    precondition(result == KERN_SUCCESS, "task_info failed: \(result)")
+    return Int(info.phys_footprint)
+}
+
+/// Counts events from callbacks on any thread.
+final class Counter: Sendable {
+    private let count = Atomic(0)
+
+    var value: Int {
+        count.load(ordering: .relaxed)
+    }
+
+    func increment() {
+        count.wrappingAdd(1, ordering: .relaxed)
+    }
 }
 
 /// Records the peak number of callers inside `occupy(for:)` at once.

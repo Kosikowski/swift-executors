@@ -271,6 +271,9 @@ public final class DispatchQueueTaskExecutor: TaskExecutor {
 public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Sendable {
     public init(name: String = "ThreadExecutor")
 
+    // Lets other jobs run inside the calling job while `body` spins the run loop
+    public func allowingNestedJobs<T, E: Error>(_ body: () throws(E) -> T) throws(E) -> T
+
     // Isolation checks used by assumeIsolated / preconditionIsolated
     public func checkIsolated()
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, watchOS 26.0, visionOS 26.0, *)
@@ -282,12 +285,41 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 - `name`: Human-readable thread name for debugging
 
 The thread starts in `init` and stops once the executor is released, after the jobs
-already queued on it have run.
+already queued on it have run. If a callback on the thread is running the run loop in
+the default mode at that moment, that run is stopped once, as `CFRunLoopStop` would, and
+the thread stops once the callback returns.
+
+Jobs run in batches, one batch per pass of the thread's run loop, so the run loop's
+timers, ports and other sources keep firing however busy the executor is.
 
 Jobs never run inside one another. If a job spins the thread's run loop, as some legacy
 APIs do while they wait for a callback, run-loop sources and callbacks still fire, but
 other jobs wait until that job returns. Code on the thread that calls `CFRunLoopStop`
 does not stop the executor.
+
+So a job that spins while it waits for another job on the same executor, for example a
+callback that hands its reply to an actor backed by the executor through
+`Task { await engine.handle(reply) }`, waits until it times out, or forever: that task
+only runs once the spinning job returns. Either reach the actor from the callback with
+`assumeIsolated`, which runs at once on the thread, `await` the reply rather than spin,
+or wrap the spinning call in `allowingNestedJobs`:
+
+```swift
+extension AudioEngine {
+    func connect() {
+        // Jobs on the executor - the reply's task among them - may now run
+        // inside this call while the legacy API spins the run loop.
+        executor.allowingNestedJobs {
+            legacyDevice.connectAndWaitForReply()
+        }
+    }
+}
+```
+
+Use `allowingNestedJobs` only where the calling job's state is consistent: as at an
+`await`, any code isolated to the executor, the calling actor's own methods included,
+may run before it returns. Jobs that run inside it do not let further jobs run inside
+themselves unless they call it too. It must be called on the executor's thread.
 
 Every job runs isolated to the executor, so a call from it to a `@concurrent` function
 goes back through the run loop instead of continuing inline.
