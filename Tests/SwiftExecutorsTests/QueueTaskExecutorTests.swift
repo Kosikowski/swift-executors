@@ -54,6 +54,15 @@ struct QueueTaskExecutorTests {
         #expect((1 ... limit).contains(tracker.peak))
     }
 
+    #if os(macOS)
+        @Test("A limit of zero traps instead of stalling every job")
+        func zeroLimitTraps() async {
+            await #expect(processExitsWith: .failure) {
+                _ = QueueTaskExecutor(label: "test.operation.zero", maxConcurrent: 0)
+            }
+        }
+    #endif
+
     @Test("Runs many short tasks to completion")
     func stress() async {
         let executor = QueueTaskExecutor(label: "test.operation.stress", maxConcurrent: 4)

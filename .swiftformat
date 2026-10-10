@@ -1,0 +1,9 @@
+# SwiftFormat configuration. CI runs `swiftformat --lint` with it.
+
+--swiftversion 6.2
+
+# Trailing commas in multi-line collections only, not in argument lists.
+--trailingcommas collections-only
+
+# @Test and @Suite display names are written as sentences on purpose.
+--disable swiftTestingTestCaseNames

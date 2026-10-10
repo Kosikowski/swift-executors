@@ -21,12 +21,12 @@ Swift Executors provides three main executor types that allow you to control how
 - **Isolation Checking**: `ThreadExecutor` implements `checkIsolated()` and `isIsolatingCurrentContext()`, so `assumeIsolated` works from callbacks on its thread (see [ThreadExecutor](#threadexecutor) for the one exception)
 - **Quality of Service**: Configure QoS levels for priority handling
 - **Swift Concurrency Integration**: Seamlessly works with Swift's async/await and structured concurrency
-- **Cross-Platform**: Supports iOS 18+ and macOS 15+
+- **Apple Platforms**: iOS 18+, macOS 15+, tvOS 18+, watchOS 11+ and visionOS 2+
 
 ## Requirements
 
 - Swift 6.2+ (Xcode 26+)
-- iOS 18+ / macOS 15+ (task executors need the Swift runtime that ships with these releases)
+- iOS 18+, macOS 15+, tvOS 18+, watchOS 11+ or visionOS 2+ (task executors need the Swift runtime that ships with these releases)
 
 ## Installation
 
@@ -140,7 +140,7 @@ Back an actor with it to pin all of that actor's code to one thread:
 import SwiftExecutors
 
 actor AudioEngine {
-    private let executor = ThreadExecutor(name: "AudioThread")
+    private let executor = ThreadExecutor(name: "AudioThread", qualityOfService: .userInteractive)
 
     nonisolated var unownedExecutor: UnownedSerialExecutor {
         executor.asUnownedSerialExecutor()
@@ -234,7 +234,7 @@ public final class QueueTaskExecutor: TaskExecutor {
 
 **Parameters:**
 - `label`: Human-readable name for debugging (shows up in Instruments/Xcode)
-- `maxConcurrent`: Maximum number of simultaneous tasks (throttles throughput)
+- `maxConcurrent`: Maximum number of simultaneous tasks (throttles throughput). Must be positive, or `OperationQueue.defaultMaxConcurrentOperationCount`; a limit of 0 traps, since no job would ever run
 - `qos`: Quality of service for priority handling
 
 ### DispatchQueueTaskExecutor
@@ -269,7 +269,7 @@ public final class DispatchQueueTaskExecutor: TaskExecutor {
 
 ```swift
 public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Sendable {
-    public init(name: String = "ThreadExecutor")
+    public init(name: String = "ThreadExecutor", qualityOfService: QualityOfService? = nil)
 
     // Lets other jobs run inside the calling job while `body` spins the run loop
     public func allowingNestedJobs<T, E: Error>(_ body: () throws(E) -> T) throws(E) -> T
@@ -283,6 +283,7 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 
 **Parameters:**
 - `name`: Human-readable thread name for debugging
+- `qualityOfService`: The thread's quality of service. `nil`, the default, inherits the creating thread's. Real-time work such as audio should ask for `.userInteractive` rather than run at the priority of whatever happened to create the executor
 
 The thread starts in `init` and stops once the executor is released, after the jobs
 already queued on it have run. If a callback on the thread is running the run loop in
@@ -320,6 +321,10 @@ Use `allowingNestedJobs` only where the calling job's state is consistent: as at
 `await`, any code isolated to the executor, the calling actor's own methods included,
 may run before it returns. Jobs that run inside it do not let further jobs run inside
 themselves unless they call it too. It must be called on the executor's thread.
+
+Any code on that thread may call it, a run-loop callback included. A callback that fires
+while a job spins the run loop and calls `allowingNestedJobs` lets the waiting jobs run
+inside that job, whether or not the job asked for it.
 
 Every job runs isolated to the executor, so a call from it to a `@concurrent` function
 goes back through the run loop instead of continuing inline.

@@ -43,7 +43,7 @@ func loadFiles(urls: [URL]) async throws -> [Data] {
 
 /// An actor whose code always runs on one dedicated thread.
 actor AudioEngine {
-    private let executor = ThreadExecutor(name: "Audio")
+    private let executor = ThreadExecutor(name: "Audio", qualityOfService: .userInteractive)
 
     nonisolated var unownedExecutor: UnownedSerialExecutor {
         executor.asUnownedSerialExecutor()
@@ -67,6 +67,7 @@ let thumbnails = DispatchQueueTaskExecutor(concurrentLabel: "Thumbnails", qos: .
 let thumbnailTask = Task(name: "Thumbnails", executorPreference: thumbnails) {
     await busyWork()
 }
+
 let checksum = await thumbnailTask.value
 print("Generated thumbnails, checksum \(checksum)")
 

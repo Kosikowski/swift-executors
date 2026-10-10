@@ -67,10 +67,15 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 
     /// Spins up the thread & run-loop pair exactly once.
     ///
-    /// - Parameter name: Shows up in Instruments and thread lists, handy
-    ///   for debugging.
+    /// - Parameters:
+    ///   - name: Shows up in Instruments and thread lists, handy for
+    ///     debugging.
+    ///   - qualityOfService: The thread's quality of service. `nil`, the
+    ///     default, inherits the creating thread's. Real-time work such as
+    ///     audio should ask for `.userInteractive` rather than run at the
+    ///     priority of whatever happened to create the executor.
     ///
-    public init(name: String = "ThreadExecutor") {
+    public init(name: String = "ThreadExecutor", qualityOfService: QualityOfService? = nil) {
         // Step 1: The worker must not reference `self`: the executor's
         //         lifetime is driven by its owners, not by its own thread.
         let worker = Worker()
@@ -78,8 +83,7 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
 
         // Step 2: Human-readable thread label for debuggers & Instruments.
         thread.name = name
-        thread.qualityOfService = Thread.currentQos // Inherit caller's QoS
-        // To prevent priority inversion set to .userInteractive
+        thread.qualityOfService = qualityOfService ?? Thread.currentQoS
 
         // Step 3: Start the thread and block until its run loop is ready.
         thread.start()
@@ -117,6 +121,11 @@ public final class ThreadExecutor: SerialExecutor, TaskExecutor, @unchecked Send
     /// methods included - may run before `body` returns. Jobs that run inside
     /// `body` do not let further jobs run inside themselves unless they call
     /// this method too.
+    ///
+    /// Any code on the executor's thread may call this method, a run-loop
+    /// callback included. A callback that fires while a job spins the run
+    /// loop and calls it lets the waiting jobs run inside that job, whether
+    /// or not the job called it itself.
     ///
     /// Must be called on the executor's thread.
     public func allowingNestedJobs<T, E: Error>(_ body: () throws(E) -> T) throws(E) -> T {
@@ -400,14 +409,15 @@ private final class Worker: @unchecked Sendable {
 }
 
 extension Thread {
-    static var currentQos: QualityOfService {
+    /// The quality of service of the calling thread.
+    static var currentQoS: QualityOfService {
         switch qos_class_self() {
-        case QOS_CLASS_USER_INTERACTIVE: return .userInteractive
-        case QOS_CLASS_USER_INITIATED: return .userInitiated
-        case QOS_CLASS_DEFAULT: return .default
-        case QOS_CLASS_UTILITY: return .utility
-        case QOS_CLASS_BACKGROUND: return .background
-        default: return .default
+        case QOS_CLASS_USER_INTERACTIVE: .userInteractive
+        case QOS_CLASS_USER_INITIATED: .userInitiated
+        case QOS_CLASS_DEFAULT: .default
+        case QOS_CLASS_UTILITY: .utility
+        case QOS_CLASS_BACKGROUND: .background
+        default: .default
         }
     }
 }

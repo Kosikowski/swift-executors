@@ -74,6 +74,21 @@ actor RunLoopSpinner {
         return done()
     }
 
+    /// Throws out of `allowingNestedJobs`, logs the error, then spins the run
+    /// loop without it, as `spin(timeout:allowingNestedJobs:onStart:until:)`
+    /// does.
+    func spinAfterThrowingOutOfNestedJobs(timeout: Duration = .milliseconds(200),
+                                          onStart: @Sendable () -> Void = {},
+                                          until done: @Sendable () -> Bool = { false }) -> Bool
+    {
+        do {
+            try executor.allowingNestedJobs { () throws(TestError) in throw .boom }
+        } catch {
+            log.append("threw \(error)")
+        }
+        return spin(timeout: timeout, onStart: onStart, until: done)
+    }
+
     /// Asks `counter` to count up through a new task, and spins the run loop
     /// until it has, the way a legacy API waits for its reply.
     func spinUntilCounted(by counter: PinnedCounter,
@@ -224,6 +239,26 @@ struct ThreadExecutorTests {
         #expect(executor.testThread.name == "test.thread")
     }
 
+    @Test("The thread runs at the requested quality of service")
+    func threadQualityOfService() {
+        let executor = ThreadExecutor(name: "test.thread.qos", qualityOfService: .userInteractive)
+
+        #expect(executor.testThread.qualityOfService == .userInteractive)
+    }
+
+    @Test("The thread inherits its creator's quality of service by default")
+    func threadInheritsQualityOfService() async {
+        let executor = await withCheckedContinuation { (created: CheckedContinuation<ThreadExecutor, Never>) in
+            let creator = Thread {
+                created.resume(returning: ThreadExecutor(name: "test.thread.inherited-qos"))
+            }
+            creator.qualityOfService = .utility
+            creator.start()
+        }
+
+        #expect(executor.testThread.qualityOfService == .utility)
+    }
+
     @Test("Each executor owns a different thread")
     func distinctThreads() {
         let other = ThreadExecutor(name: "test.thread.other")
@@ -333,11 +368,11 @@ struct ThreadExecutorTests {
     }
 
     @Test("Releasing the executor from another thread frees its run loop")
-    func releaseFromAnotherThreadFreesRunLoop() async {
+    func releaseFromAnotherThreadFreesRunLoop() async throws {
         let freed = Flag()
         var executor: ThreadExecutor? = ThreadExecutor(name: "test.thread.release")
 
-        await runOnThread(of: executor!) {
+        try await runOnThread(of: #require(executor)) {
             holdUntilRunLoopIsFreed(Sentinel(raisingWhenFreed: freed))
         }
         executor = nil
@@ -664,6 +699,120 @@ struct ThreadExecutorTests {
         #expect(!probeRanInsideInnerSpin)
         #expect(await outerSpin.value)
         #expect(await inner.log == ["spin-start", "spin-end", "probe"])
+    }
+
+    // `_swift_createJobForTestingOnly` first shipped with Swift 6.3.
+    #if compiler(>=6.3)
+        @Test("Jobs behind a job that lets jobs in run inside it first, ahead of jobs queued later")
+        @available(macOS 26.4, iOS 26.4, tvOS 26.4, watchOS 26.4, visionOS 26.4, *)
+        func jobsBehindRunInsideAheadOfLaterOnes() async {
+            let executor = executor
+            let recorder = Recorder()
+            let blockerStarted = Flag()
+            let release = DispatchSemaphore(value: 0)
+            let laterJobQueued = DispatchSemaphore(value: 0)
+            let (started, startedContinuation) = AsyncStream.makeStream(of: Void.self)
+
+            // The blocker holds the thread while jobs 1 to 3 queue up, so
+            // they run as one batch, with 2 and 3 behind 1.
+            executor.enqueue(_swift_createJobForTestingOnly {
+                blockerStarted.raise()
+                release.wait()
+            })
+            #expect(await waitUntil { blockerStarted.isRaised })
+            executor.enqueue(_swift_createJobForTestingOnly {
+                recorder.append(1)
+                startedContinuation.yield()
+                laterJobQueued.wait()
+                executor.allowingNestedJobs {
+                    let deadline = ContinuousClock.now + .seconds(5)
+                    while recorder.values.count < 4, ContinuousClock.now < deadline {
+                        _ = CFRunLoopRunInMode(.defaultMode, 0.01, true)
+                    }
+                }
+                recorder.append(5)
+            })
+            for i in 2 ... 3 {
+                executor.enqueue(_swift_createJobForTestingOnly { recorder.append(i) })
+            }
+            release.signal()
+            for await _ in started {
+                break
+            }
+            // Reaches the queue while 2 and 3 are still in job 1's batch, yet
+            // runs after them: they go back to the front of the queue.
+            executor.enqueue(_swift_createJobForTestingOnly { recorder.append(4) })
+            laterJobQueued.signal()
+
+            #expect(await waitUntil { recorder.values.count == 5 })
+            #expect(recorder.values == [1, 2, 3, 4, 5])
+        }
+    #endif
+
+    @Test("allowingNestedJobs rethrows the body's error, and jobs no longer run inside the job afterwards")
+    func allowingNestedJobsRethrowsAndClosesTheGate() async {
+        let executor = executor
+        let spinner = RunLoopSpinner(executor: executor)
+        let (started, startedContinuation) = AsyncStream.makeStream(of: Void.self)
+
+        let spin = Task {
+            await spinner.spinAfterThrowingOutOfNestedJobs(
+                timeout: .seconds(5),
+                onStart: { startedContinuation.yield() },
+                until: { executor.testQueuedJobCount >= 1 }
+            )
+        }
+        for await _ in started {
+            break
+        }
+        let probeRanInsideSpin = await spinner.record("probe")
+
+        #expect(await spin.value)
+        #expect(!probeRanInsideSpin)
+        #expect(await spinner.log == ["threw boom", "spin-start", "spin-end", "probe"])
+    }
+
+    @Test("allowingNestedJobs works from a plain callback, and jobs still do not nest afterwards")
+    func allowingNestedJobsFromCallback() async {
+        let executor = executor
+        let counter = PinnedCounter(executor: executor)
+        let replied = Flag()
+
+        let repliedInsideCallback = await runOnThread(of: executor) {
+            executor.allowingNestedJobs {
+                // The reply comes back through a job, which may run inside
+                // this callback. No job is running, so nothing is nested.
+                Task {
+                    _ = await counter.increment()
+                    replied.raise()
+                }
+                let deadline = ContinuousClock.now + .seconds(5)
+                while !replied.isRaised, ContinuousClock.now < deadline {
+                    _ = CFRunLoopRunInMode(.defaultMode, 0.01, true)
+                }
+                return replied.isRaised
+            }
+        }
+
+        // The allowance did not leak into the jobs that follow.
+        let spinner = RunLoopSpinner(executor: executor)
+        let (started, startedContinuation) = AsyncStream.makeStream(of: Void.self)
+        let spin = Task {
+            await spinner.spin(
+                timeout: .seconds(5),
+                onStart: { startedContinuation.yield() },
+                until: { executor.testQueuedJobCount >= 1 }
+            )
+        }
+        for await _ in started {
+            break
+        }
+        let probeRanInsideSpin = await spinner.record("probe")
+
+        #expect(repliedInsideCallback)
+        #expect(await counter.value == 1)
+        #expect(await spin.value)
+        #expect(!probeRanInsideSpin)
     }
 
     @Test("A job that stops the run loop does not stop the executor")

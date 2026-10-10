@@ -20,12 +20,18 @@ public final class QueueTaskExecutor: TaskExecutor {
     ///
     /// - Parameters:
     ///   - label: Human-readable name for debugging (Instruments/Xcode).
-    ///   - maxConcurrent: Max simultaneous tasks (throttles throughput).
+    ///   - maxConcurrent: Max simultaneous tasks (throttles throughput). Must be
+    ///     positive, or `OperationQueue.defaultMaxConcurrentOperationCount`: a
+    ///     queue with a limit of 0 would never run a job.
     ///   - qos: Quality of service for priority handling (e.g. `.userInitiated`, `.background`).
     public init(label: String = "TaskExec",
                 maxConcurrent: Int = OperationQueue.defaultMaxConcurrentOperationCount,
                 qos: QualityOfService = .default)
     {
+        precondition(
+            maxConcurrent > 0 || maxConcurrent == OperationQueue.defaultMaxConcurrentOperationCount,
+            "maxConcurrent must be positive or OperationQueue.defaultMaxConcurrentOperationCount, not \(maxConcurrent): no job would ever run"
+        )
         queue = OperationQueue()
         queue.name = label
         queue.maxConcurrentOperationCount = maxConcurrent // Throttle concurrency at the queue level
