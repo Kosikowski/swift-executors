@@ -33,7 +33,7 @@ jobs:
             # SwiftPM 6.2 does not treat the xros triple as a Darwin
             # platform: it cannot find the Testing module and links like
             # Linux. Only the library compiles for visionOS on this leg.
-            visionos-build: --product SwiftExecutors
+            visionos-build: --target SwiftExecutors
           - name: Swift 6.4 (Xcode 27.0)
             # GitHub's hosted Xcode 27 preview image, which installs Xcode
             # 27.0 at /Applications/Xcode_27.app. See "Xcode 27" in
