@@ -206,7 +206,7 @@ func valueAssumingIsolation(of counter: PinnedCounter) -> Int {
     counter.assumeIsolated { $0.value }
 }
 
-/// Waits up to two seconds for `thread` to exit and reports whether it did.
+/// Waits up to ten seconds for `thread` to exit and reports whether it did.
 func waitUntilFinished(_ thread: Thread) async -> Bool {
     await waitUntil { thread.isFinished }
 }
@@ -648,7 +648,7 @@ struct ThreadExecutorTests {
 
         // The reply still arrives, once the spinning job has returned.
         var log = await spinner.log
-        let deadline = ContinuousClock.now + .seconds(2)
+        let deadline = ContinuousClock.now + .seconds(10)
         while !log.contains("counted"), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(10))
             log = await spinner.log

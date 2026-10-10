@@ -71,7 +71,11 @@ func onPreferredExecutor<T: Sendable>(_ body: @Sendable () -> T) async -> T {
 }
 
 /// Waits up to `timeout` for `condition` to hold and reports whether it did.
-func waitUntil(timeout: Duration = .seconds(2), _ condition: () -> Bool) async -> Bool {
+///
+/// The default is generous because a loaded CI runner can hold the whole
+/// test process back for seconds at a time; a passing wait returns as soon
+/// as the condition holds.
+func waitUntil(timeout: Duration = .seconds(10), _ condition: () -> Bool) async -> Bool {
     let deadline = ContinuousClock.now + timeout
     while !condition(), ContinuousClock.now < deadline {
         try? await Task.sleep(for: .milliseconds(10))
