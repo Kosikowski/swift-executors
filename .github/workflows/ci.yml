@@ -64,12 +64,18 @@ jobs:
         run: swift test --skip-build
       - name: Run CLI demo
         run: swift run SwiftExecutorsCLI
+      # One test at a time: the simulator on a hosted runner is slow enough
+      # that tests which burn CPU starve the ones that wait on a thread,
+      # a spin or an overlap, and time them out. Diagnostics collection on
+      # a failure hung for ten minutes, so it is off.
       - name: Test (iOS Simulator)
         if: ${{ matrix.simulator-tests }}
         run: |
           xcodebuild test \
             -scheme SwiftExecutors-Package \
-            -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest'
+            -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' \
+            -parallel-testing-enabled NO \
+            -collect-test-diagnostics never
       # The other platforms only need to compile: their runtime behaviour
       # is the same Swift runtime the macOS and iOS legs exercise.
       # SwiftPM compiles against the SDKs inside the selected Xcode and
