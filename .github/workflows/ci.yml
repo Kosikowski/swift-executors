@@ -30,6 +30,10 @@ jobs:
             # Xcode 26.0, whose runtimes it lacks (the installed ones are
             # 26.2 and later), so the iOS tests only compile on this leg.
             simulator-tests: false
+            # SwiftPM 6.2 does not treat the xros triple as a Darwin
+            # platform: it cannot find the Testing module and links like
+            # Linux. Only the library compiles for visionOS on this leg.
+            visionos-build: --product SwiftExecutors
           - name: Swift 6.4 (Xcode 27.0)
             # GitHub's hosted Xcode 27 preview image, which installs Xcode
             # 27.0 at /Applications/Xcode_27.app. See "Xcode 27" in
@@ -39,6 +43,7 @@ jobs:
             runner: xcode-27
             xcode: Xcode_27
             simulator-tests: true
+            visionos-build: --build-tests
     env:
       DEVELOPER_DIR: /Applications/${{ matrix.xcode }}.app/Contents/Developer
     steps:
@@ -71,18 +76,20 @@ jobs:
       # needs no simulator runtime, unlike an xcodebuild destination.
       # --sdk is needed on Swift 6.2, whose SwiftPM otherwise keeps the
       # macOS SDK; Swift 6.4 derives it from the triple.
-      - name: Build for the iOS, tvOS, watchOS and visionOS simulators
+      - name: Build for the iOS, tvOS and watchOS simulators
         run: |
           for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator; do
             swift build --build-tests \
               --triple "arm64-apple-${platform%%:*}-simulator" \
               --sdk "$(xcrun --sdk "${platform##*:}" --show-sdk-path)"
           done
-          # SwiftPM 6.2 gives xros the macOS deployment target, which the
-          # compiler rejects, and mangles a version written in the triple.
-          # The last -target wins, so pass the right one after SwiftPM's
-          # own; keep its version in step with Package.swift.
-          swift build --build-tests \
+      # SwiftPM 6.2 gives xros the macOS deployment target, which the
+      # compiler rejects, and mangles a version written in the triple.
+      # The last -target wins, so pass the right one after SwiftPM's
+      # own; keep its version in step with Package.swift.
+      - name: Build for the visionOS simulator
+        run: |
+          swift build ${{ matrix.visionos-build }} \
             --triple arm64-apple-xros-simulator \
             --sdk "$(xcrun --sdk xrsimulator --show-sdk-path)" \
             -Xswiftc -target -Xswiftc arm64-apple-xros2.0-simulator
