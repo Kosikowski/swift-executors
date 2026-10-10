@@ -73,7 +73,11 @@ jobs:
       # macOS SDK; Swift 6.4 derives it from the triple.
       - name: Build for the iOS, tvOS, watchOS and visionOS simulators
         run: |
-          for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator xros:xrsimulator; do
+          # The deployment targets come from Package.swift, except that
+          # visionOS carries its own in the triple (keep it in step with
+          # Package.swift): SwiftPM 6.2 derives the macOS one for xros,
+          # which no SDK accepts.
+          for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator xros2.0:xrsimulator; do
             swift build --build-tests \
               --triple "arm64-apple-${platform%%:*}-simulator" \
               --sdk "$(xcrun --sdk "${platform##*:}" --show-sdk-path)"
