@@ -73,15 +73,19 @@ jobs:
       # macOS SDK; Swift 6.4 derives it from the triple.
       - name: Build for the iOS, tvOS, watchOS and visionOS simulators
         run: |
-          # The deployment targets come from Package.swift, except that
-          # visionOS carries its own in the triple (keep it in step with
-          # Package.swift): SwiftPM 6.2 derives the macOS one for xros,
-          # which no SDK accepts.
-          for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator xros2.0:xrsimulator; do
+          for platform in ios:iphonesimulator tvos:appletvsimulator watchos:watchsimulator; do
             swift build --build-tests \
               --triple "arm64-apple-${platform%%:*}-simulator" \
               --sdk "$(xcrun --sdk "${platform##*:}" --show-sdk-path)"
           done
+          # SwiftPM 6.2 gives xros the macOS deployment target, which the
+          # compiler rejects, and mangles a version written in the triple.
+          # The last -target wins, so pass the right one after SwiftPM's
+          # own; keep its version in step with Package.swift.
+          swift build --build-tests \
+            --triple arm64-apple-xros-simulator \
+            --sdk "$(xcrun --sdk xrsimulator --show-sdk-path)" \
+            -Xswiftc -target -Xswiftc arm64-apple-xros2.0-simulator
 
   # Formatting, against the .swiftformat config in the repository root.
   code-quality:
